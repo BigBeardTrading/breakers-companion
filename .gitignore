@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+.venv/
+
+# Build artifacts
+build/
+dist/
+release/
+
+# PyInstaller stuff
+*.spec
+
+# Logs and local data
+logs/
+*.log
+
+# Certificates / private stuff
+certs/
+*.pfx
+*.cer
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
