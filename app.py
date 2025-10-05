@@ -1,8 +1,8 @@
 # app.py
-# Breakers Companion v2.0.1 (stable + smooth search)
-# - UI matches your v2.0.0 baseline (Home/Add Set/Open Saved Sets/Save Current As)
-# - Debounced, fast search across all columns (vectorized)
-# - No UI thread blocking, no per-cell loops
+# Breakers Companion — v2.0.1
+# - Saved Sets WALL (stable)
+# - Debounced, vectorized search
+# - No custom paintEvent (prevents crash)
 #
 # Requirements: PySide6, pandas, openpyxl
 
@@ -19,6 +19,7 @@ from PySide6.QtCore import (
     QModelIndex,
     QSortFilterProxyModel,
     QTimer,
+    QDateTime,
 )
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
@@ -33,11 +34,12 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QTableView,
     QStackedWidget,
-    QListWidget,
-    QListWidgetItem,
     QMessageBox,
     QStatusBar,
     QToolBar,
+    QScrollArea,
+    QMenu,
+    QSizePolicy,
 )
 
 APP_TITLE = "Breakers Companion — v2.0.1"
@@ -48,7 +50,7 @@ EXCEL_ENGINE = "openpyxl"  # ensure openpyxl is in requirements.txt
 # -------------------
 # Persistence helpers
 # -------------------
-def load_recent_files(max_items: int = 30) -> List[str]:
+def load_recent_files(max_items: int = 60) -> List[str]:
     p = Path(RECENTS_FILE)
     if not p.exists():
         return []
@@ -75,7 +77,13 @@ def push_recent(path: Path):
     items = load_recent_files()
     s = str(Path(path))
     items = [s] + [x for x in items if x != s]
-    save_recent_files(items[:30])
+    save_recent_files(items[:60])
+
+
+def remove_recent(path: Path):
+    s = str(Path(path))
+    items = [x for x in load_recent_files() if x != s]
+    save_recent_files(items)
 
 
 # ---------------------
@@ -143,7 +151,6 @@ class RowFilterProxy(QSortFilterProxyModel):
         self._needle = text
         self.invalidateFilter()
 
-    # Cache busting when source changes
     def invalidate(self):
         self._mask = None
         super().invalidate()
@@ -165,19 +172,13 @@ class RowFilterProxy(QSortFilterProxyModel):
             self._mask = pd.Series(True, index=df.index)
             return
 
-        # Vectorized: join row values once, to lowercase, then contains()
-        try:
-            joined = (
-                df.fillna("")
-                .astype(str)
-                .agg(" ".join, axis=1)
-                .str.lower()
-            )
-            self._mask = joined.str.contains(self._needle, na=False)
-        except Exception:
-            safe = df.fillna("").astype(str)
-            joined = safe.apply(lambda r: " ".join(r.values.astype(str)).lower(), axis=1)
-            self._mask = joined.str_contains(self._needle, na=False)
+        joined = (
+            df.fillna("")
+            .astype(str)
+            .agg(" ".join, axis=1)
+            .str.lower()
+        )
+        self._mask = joined.str.contains(self._needle, na=False)
 
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
         if self._mask is None:
@@ -193,7 +194,7 @@ class RowFilterProxy(QSortFilterProxyModel):
 
 
 # ------------
-# Pages / UI
+# UI Components
 # ------------
 class HomeBar(QWidget):
     """Top strip with your existing buttons, matching the v2.0.0 layout."""
@@ -230,43 +231,106 @@ class HomeBar(QWidget):
         return self.search
 
 
-class SavedSetsPage(QWidget):
+class SetCard(QPushButton):
+    """A big clickable 'card' for one recent .xlsx file. Plain text (no HTML), no custom painting."""
+
+    def __init__(self, path: Path, on_open, parent=None):
+        super().__init__(parent)
+        self.path = Path(path)
+        self.on_open = on_open
+
+        self.setMinimumSize(260, 110)
+        self.setMaximumWidth(360)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setCheckable(False)
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.setStyleSheet("""
+            QPushButton {
+                text-align: left;
+                border: 1px solid rgba(0,0,0,0.15);
+                border-radius: 12px;
+                padding: 12px 14px;
+                background: rgba(255,255,255,0.9);
+            }
+            QPushButton:hover {
+                border-color: rgba(0,0,0,0.35);
+                background: rgba(255,255,255,0.98);
+            }
+        """)
+
+        name = self.path.name
+        folder = str(self.path.parent)
+        try:
+            mtime_ts = int(self.path.stat().st_mtime)
+            mtime = QDateTime.fromSecsSinceEpoch(mtime_ts).toString("yyyy-MM-dd  HH:mm")
+        except Exception:
+            mtime = "—"
+
+        # Plain text with newlines (Qt renders nicely on a QPushButton)
+        self.setText(f"{name}\n{folder}\nModified: {mtime}")
+        self.setToolTip(str(self.path))
+
+        self.clicked.connect(lambda: self.on_open(self.path))
+
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        remove_action = menu.addAction("Remove from Saved")
+        action = menu.exec(event.globalPos())
+        if action == remove_action:
+            remove_recent(self.path)
+            self.setDisabled(True)  # visual hint; wall refreshes next time
+
+
+class SavedSetsWall(QWidget):
+    """Scrollable 'flow' wall of SetCard buttons."""
+
     def __init__(self, on_open_path, on_back, parent=None):
         super().__init__(parent)
         self.on_open_path = on_open_path
 
         v = QVBoxLayout(self)
-        hdr = QHBoxLayout()
+        header = QHBoxLayout()
         title = QLabel("Saved Sets")
-        title.setStyleSheet("font-size: 18px; font-weight: 600;")
+        title.setStyleSheet("font-size: 22px; font-weight: 600;")
         back = QPushButton("← Back")
         back.clicked.connect(on_back)
-        hdr.addWidget(title)
-        hdr.addStretch(1)
-        hdr.addWidget(back)
-        v.addLayout(hdr)
+        header.addWidget(title)
+        header.addStretch(1)
+        header.addWidget(back)
+        v.addLayout(header)
 
-        self.listw = QListWidget()
-        v.addWidget(self.listw, 1)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        v.addWidget(self.scroll, 1)
 
-        open_btn = QPushButton("Open Selected")
-        open_btn.clicked.connect(self._open_selected)
-        v.addWidget(open_btn)
+        self.inner = QWidget()
+        self.row = QHBoxLayout(self.inner)
+        self.row.setContentsMargins(10, 10, 10, 10)
+        self.row.setSpacing(10)
+        self.scroll.setWidget(self.inner)
+
+        self.refresh()
 
     def refresh(self):
-        self.listw.clear()
-        for s in load_recent_files():
-            self.listw.addItem(QListWidgetItem(s))
+        # Clear old widgets
+        while self.row.count():
+            item = self.row.takeAt(0)
+            w = item.widget()
+            if w:
+                w.setParent(None)
 
-    def _open_selected(self):
-        it = self.listw.currentItem()
-        if not it:
+        recents = load_recent_files()
+        if not recents:
+            empty = QLabel("No saved sets yet. Open a .xlsx file to add it here.")
+            empty.setStyleSheet("color:#666; font-style: italic;")
+            self.row.addWidget(empty)
+            self.row.addStretch(1)
             return
-        p = Path(it.text())
-        if not p.exists():
-            QMessageBox.warning(self, "Missing File", f"File not found:\n{p}")
-            return
-        self.on_open_path(p)
+
+        for s in recents:
+            self.row.addWidget(SetCard(Path(s), on_open=self.on_open_path, parent=self.inner))
+
+        self.row.addStretch(1)
 
 
 class TablePage(QWidget):
@@ -304,7 +368,6 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(APP_TITLE)
         self.resize(1200, 800)
 
-        # Toolbar (kept minimal; File->Open shortcut)
         tb = QToolBar("Main")
         tb.setMovable(False)
         self.addToolBar(tb)
@@ -315,14 +378,13 @@ class MainWindow(QMainWindow):
         self.status = QStatusBar(self)
         self.setStatusBar(self.status)
 
-        # Stacked pages (Home/Saved/Table)
         central = QWidget(self)
         outer = QVBoxLayout(central)
 
         self.bar = HomeBar(
             on_home=self._show_home,
             on_add_set=self._open_file_dialog,
-            on_open_saved=self._show_saved,
+            on_open_saved=self._show_saved_wall,
             on_save_current=self._save_current_as,
         )
         outer.addWidget(self.bar)
@@ -339,16 +401,16 @@ class MainWindow(QMainWindow):
         hv.addWidget(title)
         hv.addStretch(2)
 
-        self.saved = SavedSetsPage(self._open_saved_path, self._show_home)
+        self.saved_wall = SavedSetsWall(self._open_saved_path, self._show_home)
         self.table = TablePage()
 
-        self.stack.addWidget(self.home)   # 0
-        self.stack.addWidget(self.saved)  # 1
-        self.stack.addWidget(self.table)  # 2
+        self.stack.addWidget(self.home)       # 0
+        self.stack.addWidget(self.saved_wall) # 1
+        self.stack.addWidget(self.table)      # 2
 
         self.setCentralWidget(central)
 
-        # Hook up debounced search
+        # Debounced search
         self._debounce = QTimer(self)
         self._debounce.setInterval(200)
         self._debounce.setSingleShot(True)
@@ -365,8 +427,8 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(0)
         self.status.showMessage("Ready", 1500)
 
-    def _show_saved(self):
-        self.saved.refresh()
+    def _show_saved_wall(self):
+        self.saved_wall.refresh()
         self.stack.setCurrentIndex(1)
         self.status.clearMessage()
 
@@ -419,7 +481,6 @@ class MainWindow(QMainWindow):
         if not dest:
             return
         try:
-            # Re-read and save a fresh copy (simple, reliable)
             df = self.table.src_model.dataframe()
             if df is None or df.empty:
                 QMessageBox.information(self, "Nothing to Save", "No data to save.")
