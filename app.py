@@ -1,343 +1,443 @@
-# app.py — The Breakers Companion (v2.0)
-# Requires: PySide6, pandas, openpyxl
+# app.py
+# Breakers Companion v2.0.1 (stable + smooth search)
+# - UI matches your v2.0.0 baseline (Home/Add Set/Open Saved Sets/Save Current As)
+# - Debounced, fast search across all columns (vectorized)
+# - No UI thread blocking, no per-cell loops
+#
+# Requirements: PySide6, pandas, openpyxl
 
-import os, sys, shutil, json
+import json
+import sys
 from pathlib import Path
+from typing import List, Optional
 
-from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QSize
-from PySide6.QtGui import QIcon, QAction
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QFileDialog, QTableView, QLineEdit, QFrame, QMessageBox,
-    QStatusBar
-)
-
-# -----------------------------
-# Helpers for bundled resources
-# -----------------------------
-def resource_path(*relative_parts: str) -> str:
-    """
-    Resolve a file path that works for both source runs and PyInstaller onefile.
-    """
-    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        base = Path(sys._MEIPASS)  # type: ignore
-    else:
-        base = Path(__file__).parent
-    return str(base.joinpath(*relative_parts))
-
-APP_NAME = "Breakers Companion"
-APP_VERSION = "v2.0"
-APP_ID_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "BreakersCompanion"
-SETS_DIR = APP_ID_DIR / "sets"
-CONFIG_PATH = APP_ID_DIR / "config.json"
-DEFAULT_SET_NAME = "2025 Donruss Football Master Checklist.xlsx"
-DEFAULT_SET_SRC = resource_path("data", DEFAULT_SET_NAME)
-
-# -----------------------------
-# First-run setup
-# -----------------------------
-def ensure_app_dirs():
-    APP_ID_DIR.mkdir(parents=True, exist_ok=True)
-    SETS_DIR.mkdir(parents=True, exist_ok=True)
-    if not CONFIG_PATH.exists():
-        CONFIG_PATH.write_text(json.dumps({"recent": []}, indent=2))
-
-def seed_default_set():
-    dst = SETS_DIR / DEFAULT_SET_NAME
-    if os.path.exists(DEFAULT_SET_SRC) and not dst.exists():
-        try:
-            shutil.copy2(DEFAULT_SET_SRC, dst)
-        except Exception:
-            pass
-
-# -----------------------------
-# Minimal Pandas -> Qt Model
-# -----------------------------
 import pandas as pd
 
-class PandasModel(QAbstractTableModel):
-    def __init__(self, df: pd.DataFrame):
-        super().__init__()
-        self._df = df.copy()
-        self._display = self._df
+from PySide6.QtCore import (
+    Qt,
+    QAbstractTableModel,
+    QModelIndex,
+    QSortFilterProxyModel,
+    QTimer,
+)
+from PySide6.QtGui import QAction
+from PySide6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QPushButton,
+    QLabel,
+    QLineEdit,
+    QFileDialog,
+    QTableView,
+    QStackedWidget,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
+    QStatusBar,
+    QToolBar,
+)
+
+APP_TITLE = "Breakers Companion — v2.0.1"
+RECENTS_FILE = "saved_sets.json"
+EXCEL_ENGINE = "openpyxl"  # ensure openpyxl is in requirements.txt
+
+
+# -------------------
+# Persistence helpers
+# -------------------
+def load_recent_files(max_items: int = 30) -> List[str]:
+    p = Path(RECENTS_FILE)
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        items = [s for s in data if isinstance(s, str)]
+        items = [s for s in items if Path(s).exists()]
+        return items[:max_items]
+    except Exception:
+        return []
+
+
+def save_recent_files(items: List[str]):
+    seen = set()
+    out: List[str] = []
+    for s in items:
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    Path(RECENTS_FILE).write_text(json.dumps(out, indent=2), encoding="utf-8")
+
+
+def push_recent(path: Path):
+    items = load_recent_files()
+    s = str(Path(path))
+    items = [s] + [x for x in items if x != s]
+    save_recent_files(items[:30])
+
+
+# ---------------------
+# DataFrame table model
+# ---------------------
+class DataFrameModel(QAbstractTableModel):
+    def __init__(self, df: Optional[pd.DataFrame] = None, parent=None):
+        super().__init__(parent)
+        self._df = df if df is not None else pd.DataFrame()
+
+    def setDataFrame(self, df: pd.DataFrame):
+        self.beginResetModel()
+        self._df = df
+        self.endResetModel()
 
     def rowCount(self, parent=QModelIndex()):
-        return 0 if parent.isValid() else len(self._display)
+        if parent.isValid():
+            return 0
+        return 0 if self._df is None else len(self._df)
 
     def columnCount(self, parent=QModelIndex()):
-        return 0 if parent.isValid() else len(self._display.columns)
+        if parent.isValid():
+            return 0
+        return 0 if self._df is None else self._df.shape[1]
 
     def data(self, index, role=Qt.DisplayRole):
-        if not index.isValid():
+        if not index.isValid() or self._df is None:
             return None
-        if role in (Qt.DisplayRole, Qt.EditRole):
-            val = self._display.iat[index.row(), index.column()]
-            return "" if pd.isna(val) else str(val)
+        if role == Qt.DisplayRole:
+            val = self._df.iat[index.row(), index.column()]
+            if pd.isna(val):
+                return ""
+            return str(val)
         return None
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
-        if role != Qt.DisplayRole:
+        if role != Qt.DisplayRole or self._df is None:
             return None
         if orientation == Qt.Horizontal:
-            return str(self._display.columns[section])
+            try:
+                return str(self._df.columns[section])
+            except Exception:
+                return ""
         return str(section + 1)
 
-    # simple filter
-    def filter(self, text: str):
-        if not text.strip():
-            self._display = self._df
-        else:
-            t = text.strip().lower()
-            mask = pd.Series(False, index=self._df.index)
-            for col in self._df.columns:
-                try:
-                    mask = mask | self._df[col].astype(str).str.lower().str.contains(t, na=False)
-                except Exception:
-                    pass
-            self._display = self._df[mask]
-        self.layoutChanged.emit()
+    def dataframe(self) -> pd.DataFrame:
+        return self._df
 
-# -----------------------------
+
+# ---------------------------------
+# Fast, debounced all-columns filter
+# ---------------------------------
+class RowFilterProxy(QSortFilterProxyModel):
+    """Case-insensitive contains filter using a vectorized mask per query."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._needle = ""
+        self._mask = None  # pandas Series[bool] aligned to source rows
+
+    def setFilterQuery(self, text: str):
+        text = (text or "").strip().lower()
+        if text == self._needle:
+            return
+        self._needle = text
+        self.invalidateFilter()
+
+    # Cache busting when source changes
+    def invalidate(self):
+        self._mask = None
+        super().invalidate()
+
+    def invalidateFilter(self):
+        self._mask = None
+        super().invalidateFilter()
+
+    def _compute_mask(self):
+        src = self.sourceModel()
+        if src is None:
+            self._mask = None
+            return
+        df = getattr(src, "dataframe", lambda: None)()
+        if df is None or df.empty:
+            self._mask = None
+            return
+        if not self._needle:
+            self._mask = pd.Series(True, index=df.index)
+            return
+
+        # Vectorized: join row values once, to lowercase, then contains()
+        try:
+            joined = (
+                df.fillna("")
+                .astype(str)
+                .agg(" ".join, axis=1)
+                .str.lower()
+            )
+            self._mask = joined.str.contains(self._needle, na=False)
+        except Exception:
+            safe = df.fillna("").astype(str)
+            joined = safe.apply(lambda r: " ".join(r.values.astype(str)).lower(), axis=1)
+            self._mask = joined.str_contains(self._needle, na=False)
+
+    def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
+        if self._mask is None:
+            self._compute_mask()
+        if self._mask is None:
+            return True
+        if source_row < 0 or source_row >= len(self._mask):
+            return True
+        try:
+            return bool(self._mask.iat[source_row])
+        except Exception:
+            return True
+
+
+# ------------
+# Pages / UI
+# ------------
+class HomeBar(QWidget):
+    """Top strip with your existing buttons, matching the v2.0.0 layout."""
+
+    def __init__(self, on_home, on_add_set, on_open_saved, on_save_current, parent=None):
+        super().__init__(parent)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(8, 4, 8, 4)
+
+        home_btn = QPushButton("Home")
+        add_btn = QPushButton("Add Set")
+        saved_btn = QPushButton("Open Saved Sets")
+        save_btn = QPushButton("Save Current As...")
+
+        home_btn.clicked.connect(on_home)
+        add_btn.clicked.connect(on_add_set)
+        saved_btn.clicked.connect(on_open_saved)
+        save_btn.clicked.connect(on_save_current)
+
+        row.addWidget(home_btn)
+        row.addWidget(add_btn)
+        row.addWidget(saved_btn)
+        row.addWidget(save_btn)
+        row.addStretch(1)
+
+        row.addWidget(QLabel("Search:"))
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Player, Team, ...")
+        self.search.setClearButtonEnabled(True)
+        self.search.setFixedWidth(220)
+        row.addWidget(self.search)
+
+    def searchLine(self) -> QLineEdit:
+        return self.search
+
+
+class SavedSetsPage(QWidget):
+    def __init__(self, on_open_path, on_back, parent=None):
+        super().__init__(parent)
+        self.on_open_path = on_open_path
+
+        v = QVBoxLayout(self)
+        hdr = QHBoxLayout()
+        title = QLabel("Saved Sets")
+        title.setStyleSheet("font-size: 18px; font-weight: 600;")
+        back = QPushButton("← Back")
+        back.clicked.connect(on_back)
+        hdr.addWidget(title)
+        hdr.addStretch(1)
+        hdr.addWidget(back)
+        v.addLayout(hdr)
+
+        self.listw = QListWidget()
+        v.addWidget(self.listw, 1)
+
+        open_btn = QPushButton("Open Selected")
+        open_btn.clicked.connect(self._open_selected)
+        v.addWidget(open_btn)
+
+    def refresh(self):
+        self.listw.clear()
+        for s in load_recent_files():
+            self.listw.addItem(QListWidgetItem(s))
+
+    def _open_selected(self):
+        it = self.listw.currentItem()
+        if not it:
+            return
+        p = Path(it.text())
+        if not p.exists():
+            QMessageBox.warning(self, "Missing File", f"File not found:\n{p}")
+            return
+        self.on_open_path(p)
+
+
+class TablePage(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        v = QVBoxLayout(self)
+
+        self.src_model = DataFrameModel(pd.DataFrame())
+        self.proxy = RowFilterProxy(self)
+        self.proxy.setSourceModel(self.src_model)
+
+        self.table = QTableView()
+        self.table.setModel(self.proxy)
+        self.table.setSortingEnabled(True)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QTableView.SelectRows)
+        self.table.setEditTriggers(QTableView.NoEditTriggers)
+        self.table.horizontalHeader().setStretchLastSection(True)
+
+        v.addWidget(self.table, 1)
+
+    def set_dataframe(self, df: pd.DataFrame):
+        self.src_model.setDataFrame(df)
+        self.proxy.invalidate()
+        self.table.resizeColumnsToContents()
+        self.table.horizontalHeader().setStretchLastSection(True)
+
+
+# --------------
 # Main Window
-# -----------------------------
+# --------------
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"{APP_NAME} — {APP_VERSION}")
-        self.setWindowIcon(QIcon(resource_path("assets", "BBT_BreakersCompanion.ico")))
+        self.setWindowTitle(APP_TITLE)
         self.resize(1200, 800)
 
-        # Central
-        central = QWidget()
+        # Toolbar (kept minimal; File->Open shortcut)
+        tb = QToolBar("Main")
+        tb.setMovable(False)
+        self.addToolBar(tb)
+        open_act = QAction("Open .xlsx", self)
+        open_act.triggered.connect(self._open_file_dialog)
+        tb.addAction(open_act)
+
+        self.status = QStatusBar(self)
+        self.setStatusBar(self.status)
+
+        # Stacked pages (Home/Saved/Table)
+        central = QWidget(self)
+        outer = QVBoxLayout(central)
+
+        self.bar = HomeBar(
+            on_home=self._show_home,
+            on_add_set=self._open_file_dialog,
+            on_open_saved=self._show_saved,
+            on_save_current=self._save_current_as,
+        )
+        outer.addWidget(self.bar)
+
+        self.stack = QStackedWidget(self)
+        outer.addWidget(self.stack, 1)
+
+        self.home = QWidget()
+        hv = QVBoxLayout(self.home)
+        title = QLabel("The Breakers Companion")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("font-size: 26px; font-weight: 700;")
+        hv.addStretch(1)
+        hv.addWidget(title)
+        hv.addStretch(2)
+
+        self.saved = SavedSetsPage(self._open_saved_path, self._show_home)
+        self.table = TablePage()
+
+        self.stack.addWidget(self.home)   # 0
+        self.stack.addWidget(self.saved)  # 1
+        self.stack.addWidget(self.table)  # 2
+
         self.setCentralWidget(central)
-        root = QVBoxLayout(central)
-        root.setContentsMargins(0, 0, 0, 0)
 
-        # Header strip with logo left, version right
-        header = QWidget()
-        header.setObjectName("HeaderBar")
-        header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(16, 10, 16, 10)
+        # Hook up debounced search
+        self._debounce = QTimer(self)
+        self._debounce.setInterval(200)
+        self._debounce.setSingleShot(True)
+        self.bar.searchLine().textChanged.connect(lambda _: self._debounce.start())
+        self._debounce.timeout.connect(self._apply_search)
 
-        logo = QLabel()
-        logo.setPixmap(QIcon(resource_path("assets", "bbt.png")).pixmap(QSize(40, 40)))
-        logo.setToolTip("Big Beard Trading")
-        title = QLabel(f"<b style='font-size:20px;'>The Breakers Companion</b>")
-        title.setTextFormat(Qt.RichText)
+        # State
+        self._current_path: Optional[Path] = None
 
-        left_box = QHBoxLayout()
-        left_box.addWidget(logo)
-        left_box.addSpacing(10)
-        left_box.addWidget(title)
-        left_box.addStretch(1)
+        self._show_home()
 
-        version = QLabel(f"{APP_VERSION}")
-        version.setObjectName("VersionTag")
-        version.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+    # ----- Nav
+    def _show_home(self):
+        self.stack.setCurrentIndex(0)
+        self.status.showMessage("Ready", 1500)
 
-        header_layout.addLayout(left_box)
-        header_layout.addWidget(version)
-        root.addWidget(header)
+    def _show_saved(self):
+        self.saved.refresh()
+        self.stack.setCurrentIndex(1)
+        self.status.clearMessage()
 
-        # Toolbar row (clean: Home, Add Set, Open Saved Sets, Save Current)
-        tools = QWidget()
-        tools_layout = QHBoxLayout(tools)
-        tools_layout.setContentsMargins(16, 8, 16, 8)
+    def _show_table(self):
+        self.stack.setCurrentIndex(2)
+        self.status.clearMessage()
 
-        self.btn_home = QPushButton("Home")
-        self.btn_add = QPushButton("Add Set")
-        self.btn_open = QPushButton("Open Saved Sets")
-        self.btn_save = QPushButton("Save Current As…")
+    # ----- Search
+    def _apply_search(self):
+        self.table.proxy.setFilterQuery(self.bar.searchLine().text())
 
-        for b in (self.btn_home, self.btn_add, self.btn_open, self.btn_save):
-            b.setCursor(Qt.PointingHandCursor)
-
-        tools_layout.addWidget(self.btn_home)
-        tools_layout.addSpacing(12)
-        tools_layout.addWidget(self.btn_add)
-        tools_layout.addWidget(self.btn_open)
-        tools_layout.addWidget(self.btn_save)
-        tools_layout.addStretch(1)
-
-        # quick search
-        tools_layout.addWidget(QLabel("Search:"))
-        self.search = QLineEdit()
-        self.search.setPlaceholderText("Player, Team, Subset, etc.")
-        tools_layout.addWidget(self.search)
-
-        root.addWidget(tools)
-
-        # Divider
-        line = QFrame()
-        line.setFrameShape(QFrame.HLine)
-        line.setFrameShadow(QFrame.Sunken)
-        root.addWidget(line)
-
-        # Table
-        self.table = QTableView()
-        self.table.setSortingEnabled(True)
-        root.addWidget(self.table, stretch=1)
-
-        # Status bar
-        sb = QStatusBar()
-        self.setStatusBar(sb)
-        sb.showMessage("Ready")
-
-        # Connects
-        self.btn_home.clicked.connect(self.on_home)
-        self.btn_add.clicked.connect(self.on_add_set)
-        self.btn_open.clicked.connect(self.on_open_saved)
-        self.btn_save.clicked.connect(self.on_save_as)
-        self.search.textChanged.connect(self.on_search)
-
-        # Load default
-        self.current_path = None
-        self.model = None
-        self.apply_styles()
-        self.ensure_seed_and_load()
-
-    def apply_styles(self):
-        # soft grayscale background & tag styles
-        bg_path = resource_path("assets", "Background.png").replace("\\", "/")
-        self.setStyleSheet(f"""
-            QMainWindow {{
-                background-image: url("{bg_path}");
-                background-attachment: fixed;
-                background-position: center;
-            }}
-            #HeaderBar {{
-                background: rgba(0,0,0,0.55);
-                color: white;
-            }}
-            #VersionTag {{
-                color: #eaeaea;
-                padding: 4px 8px;
-                border: 1px solid rgba(255,255,255,0.25);
-                border-radius: 8px;
-                font-weight: 600;
-            }}
-            QPushButton {{
-                padding: 6px 12px;
-                border: 1px solid rgba(0,0,0,0.15);
-                border-radius: 8px;
-                background: rgba(255,255,255,0.85);
-            }}
-            QPushButton:hover {{
-                background: white;
-            }}
-            QLineEdit {{
-                padding: 6px 10px;
-                border-radius: 8px;
-                background: rgba(255,255,255,0.95);
-            }}
-            QTableView {{
-                background: rgba(255,255,255,0.95);
-                gridline-color: #ddd;
-            }}
-        """)
-
-    def ensure_seed_and_load(self):
-        ensure_app_dirs()
-        seed_default_set()
-        default_file = SETS_DIR / DEFAULT_SET_NAME
-        if default_file.exists():
-            self.load_file(default_file)
-        else:
-            QMessageBox.information(self, APP_NAME, "Click **Add Set** to import your first checklist.")
-
-    # ---------- actions ----------
-    def on_home(self):
-        # For now, home just clears the search
-        self.search.clear()
-        self.statusBar().showMessage("Home")
-
-    def on_add_set(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Add Set (Excel)", str(Path.home()),
-            "Excel Files (*.xlsx *.xls)"
+    # ----- File ops
+    def _open_file_dialog(self):
+        path_str, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Set (.xlsx)",
+            str(Path.home()),
+            "Excel Files (*.xlsx)"
         )
-        if not path:
+        if not path_str:
             return
-        # copy into SETS_DIR
-        SETS_DIR.mkdir(parents=True, exist_ok=True)
-        dst = SETS_DIR / Path(path).name
+        self._open_path(Path(path_str))
+
+    def _open_saved_path(self, p: Path):
+        self._open_path(p)
+
+    def _open_path(self, p: Path):
         try:
-            shutil.copy2(path, dst)
-            self.load_file(dst)
-            self.statusBar().showMessage(f"Imported: {dst.name}")
+            self.status.showMessage(f"Loading {p.name} …")
+            df = pd.read_excel(p, engine=EXCEL_ENGINE)
+            df.columns = [str(c) if c is not None else "" for c in df.columns]
+            self.table.set_dataframe(df)
+            push_recent(p)
+            self._current_path = p
+            self._show_table()
+            self.status.showMessage(f"Loaded {p.name} — {len(df):,} rows × {df.shape[1]} cols", 5000)
         except Exception as e:
-            QMessageBox.warning(self, APP_NAME, f"Failed to import:\n{e}")
+            QMessageBox.critical(self, "Load Error", f"Failed to open file:\n{p}\n\n{e}")
 
-    def on_open_saved(self):
-        # open a picker inside SETS_DIR
-        start = str(SETS_DIR if SETS_DIR.exists() else Path.home())
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open Saved Set", start, "Excel Files (*.xlsx *.xls)"
-        )
-        if path:
-            self.load_file(Path(path))
-
-    def on_save_as(self):
-        if self.model is None or self.current_path is None:
-            QMessageBox.information(self, APP_NAME, "No set is loaded.")
+    def _save_current_as(self):
+        if self._current_path is None:
+            QMessageBox.information(self, "No Set Loaded", "Open a set before saving.")
             return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save Current As", str(SETS_DIR), "Excel Files (*.xlsx)"
+        dest, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Current As…",
+            str(self._current_path.with_suffix(".xlsx")),
+            "Excel Files (*.xlsx)"
         )
-        if not path:
+        if not dest:
             return
         try:
-            # Save displayed (filtered or not) to xlsx
-            df = self.model._display  # current view
-            df.to_excel(path, index=False)
-            self.statusBar().showMessage(f"Saved: {Path(path).name}")
+            # Re-read and save a fresh copy (simple, reliable)
+            df = self.table.src_model.dataframe()
+            if df is None or df.empty:
+                QMessageBox.information(self, "Nothing to Save", "No data to save.")
+                return
+            df.to_excel(dest, index=False, engine=EXCEL_ENGINE)
+            self.status.showMessage(f"Saved copy to {Path(dest).name}", 4000)
         except Exception as e:
-            QMessageBox.warning(self, APP_NAME, f"Save failed:\n{e}")
+            QMessageBox.critical(self, "Save Error", f"Failed to save:\n{dest}\n\n{e}")
 
-    def on_search(self, text: str):
-        if self.model:
-            self.model.filter(text)
 
-    # ---------- core ----------
-    def load_file(self, path: Path):
-        try:
-            df = pd.read_excel(str(path))
-            # If the template has a header row offset, you can massage here later.
-            self.model = PandasModel(df)
-            self.table.setModel(self.model)
-            self.current_path = path
-            self.setWindowTitle(f"{APP_NAME} — {APP_VERSION} — {path.name}")
-            self.statusBar().showMessage(f"Loaded {path.name} ({len(df)} rows)")
-            self.remember_recent(path)
-        except Exception as e:
-            QMessageBox.critical(self, APP_NAME, f"Could not load file:\n{e}")
-
-    def remember_recent(self, path: Path):
-        try:
-            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            data = {"recent": []}
-        recent = [str(path)] + [p for p in data.get("recent", []) if p != str(path)]
-        data["recent"] = recent[:10]
-        CONFIG_PATH.write_text(json.dumps(data, indent=2))
-
-# -----------------------------
+# ----------
 # Entry
-# -----------------------------
+# ----------
 def main():
-    ensure_app_dirs()
-    seed_default_set()
-
     app = QApplication(sys.argv)
-    win = MainWindow()
-
-    # Minimal menu with Quit (kept super clean)
-    menu = win.menuBar().addMenu("File")
-    act_quit = QAction("Quit", win)
-    act_quit.triggered.connect(app.quit)
-    menu.addAction(act_quit)
-
-    win.show()
+    app.setApplicationName(APP_TITLE)
+    w = MainWindow()
+    w.show()
     sys.exit(app.exec())
 
 if __name__ == "__main__":
