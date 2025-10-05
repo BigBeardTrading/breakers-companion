@@ -1,13 +1,13 @@
+# .github/workflows/release.yml
 name: Build & Attach Windows Release
 
 on:
   push:
     tags:
-      - 'v*'            # runs when you push a tag like v2.0.21, v2.0.22, etc.
+      - 'v*'     # e.g. v2.0.22, v2.0.23, etc.
 
-# needed so the workflow can create/attach a GitHub Release
 permissions:
-  contents: write
+  contents: write  # required to create/update a release and upload assets
 
 jobs:
   build-windows:
@@ -20,67 +20,68 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          # Matches what you've been using locally; PyInstaller 6.16+ supports 3.13
-          python-version: '3.13'
-
-      - name: Python info
-        shell: pwsh
-        run: |
-          python -V
-          where python
+          python-version: '3.12'  # stable for PyInstaller + PySide6
 
       - name: Install dependencies
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
           if (Test-Path "requirements.txt") {
-            python -m pip install -r requirements.txt
+            pip install -r "requirements.txt"
           }
           python -m pip install pyinstaller
-          python -m PyInstaller --version
 
       - name: Build EXE (spec or app.py)
         shell: pwsh
         run: |
           if (Test-Path ".\Breakers Companion.spec") {
             python -m PyInstaller ".\Breakers Companion.spec"
-          } else {
+          }
+          else {
             Write-Host "Spec not found. Building from app.py as onefile..."
             python -m PyInstaller --noconfirm --onefile --name "Breakers Companion" ".\app.py"
           }
 
-      - name: Verify build output
+      - name: Find built EXE
+        id: findexe
         shell: pwsh
         run: |
-          Write-Host "dist contents:"
-          Get-ChildItem ".\dist" -Recurse | Format-Table -AutoSize
-          if (-not (Test-Path ".\dist\Breakers Companion.exe")) {
-            throw "Build failed: '.\dist\Breakers Companion.exe' not found."
+          $exe1 = ".\dist\Breakers Companion.exe"
+          $exe2 = ".\dist\Breakers Companion\Breakers Companion.exe"
+
+          if (Test-Path $exe1) { $exePath = $exe1 }
+          elseif (Test-Path $exe2) { $exePath = $exe2 }
+          else {
+            Write-Host "dist contents:"; Get-ChildItem ".\dist" -Recurse | Format-Table -AutoSize
+            throw "Build failed: could not find the EXE in dist."
           }
+
+          # Expose for later steps
+          "EXE_PATH=$exePath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Package folder
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"         # e.g., v2.0.21
+          $tag = "${{ github.ref_name }}"      # e.g., v2.0.22
           if ($tag -match '^v(.+)$') { $ver = $Matches[1] } else { $ver = $tag }
           $pkg = "Breakers Companion-$ver"
 
           Remove-Item -Recurse -Force $pkg -ErrorAction SilentlyContinue
           New-Item -ItemType Directory $pkg | Out-Null
 
-          Copy-Item ".\dist\Breakers Companion.exe" "$pkg\Breakers Companion.exe"
+          Copy-Item "${{ env.EXE_PATH }}" "$pkg\Breakers Companion.exe"
           if (Test-Path ".\assets") { Copy-Item -Recurse -Force ".\assets" "$pkg\assets" }
           if (Test-Path ".\run.bat") { Copy-Item ".\run.bat" "$pkg\run.bat" }
           if (Test-Path ".\Version") { Copy-Item ".\Version" "$pkg\Version" }
 
-          $zip = "$pkg.zip"
-          Compress-Archive -Path "$pkg\*" -DestinationPath "$zip" -Force
-          echo "ZIP=$zip" >> $env:GITHUB_ENV
+          Compress-Archive -Path "$pkg\*" -DestinationPath "$pkg.zip" -Force
+
+          "PKG_ZIP=$pkg.zip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Create / Update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.ZIP }}
+          tag_name: ${{ github.ref_name }}
           name: Breakers Companion ${{ github.ref_name }}
-          draft: false
-          prerelease: false
+          body: "Automated Windows build for ${{ github.ref_name }}."
+          files: ${{ env.PKG_ZIP }}
