@@ -1,16 +1,17 @@
-# .github/workflows/release.yml
 name: Build & Attach Windows Release
 
 on:
   push:
     tags:
-      - 'v*'   # run on tags like v2.0.21, v2.0.22, etc.
+      - 'v*'            # runs when you push a tag like v2.0.21, v2.0.22, etc.
+
+# needed so the workflow can create/attach a GitHub Release
+permissions:
+  contents: write
 
 jobs:
   build-windows:
     runs-on: windows-latest
-    permissions:
-      contents: write  # needed to create/upload a release asset
 
     steps:
       - name: Checkout
@@ -19,33 +20,41 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'  # stable for PyInstaller on GH runners
+          # Matches what you've been using locally; PyInstaller 6.16+ supports 3.13
+          python-version: '3.13'
+
+      - name: Python info
+        shell: pwsh
+        run: |
+          python -V
+          where python
 
       - name: Install dependencies
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
           if (Test-Path "requirements.txt") {
-            pip install -r "requirements.txt"
+            python -m pip install -r requirements.txt
           }
-          pip install pyinstaller
+          python -m pip install pyinstaller
+          python -m PyInstaller --version
 
       - name: Build EXE (spec or app.py)
         shell: pwsh
         run: |
           if (Test-Path ".\Breakers Companion.spec") {
-            py -m PyInstaller ".\Breakers Companion.spec"
-          }
-          else {
+            python -m PyInstaller ".\Breakers Companion.spec"
+          } else {
             Write-Host "Spec not found. Building from app.py as onefile..."
-            py -m PyInstaller --noconfirm --onefile --name "Breakers Companion" ".\app.py"
+            python -m PyInstaller --noconfirm --onefile --name "Breakers Companion" ".\app.py"
           }
 
       - name: Verify build output
         shell: pwsh
         run: |
+          Write-Host "dist contents:"
+          Get-ChildItem ".\dist" -Recurse | Format-Table -AutoSize
           if (-not (Test-Path ".\dist\Breakers Companion.exe")) {
-            Write-Host "dist contents:"; Get-ChildItem ".\dist" -Recurse | Format-Table -AutoSize
             throw "Build failed: '.\dist\Breakers Companion.exe' not found."
           }
 
@@ -59,4 +68,19 @@ jobs:
           Remove-Item -Recurse -Force $pkg -ErrorAction SilentlyContinue
           New-Item -ItemType Directory $pkg | Out-Null
 
-          Copy-Item ".\dist\Breakers Companion.exe" "$pkg\Break
+          Copy-Item ".\dist\Breakers Companion.exe" "$pkg\Breakers Companion.exe"
+          if (Test-Path ".\assets") { Copy-Item -Recurse -Force ".\assets" "$pkg\assets" }
+          if (Test-Path ".\run.bat") { Copy-Item ".\run.bat" "$pkg\run.bat" }
+          if (Test-Path ".\Version") { Copy-Item ".\Version" "$pkg\Version" }
+
+          $zip = "$pkg.zip"
+          Compress-Archive -Path "$pkg\*" -DestinationPath "$zip" -Force
+          echo "ZIP=$zip" >> $env:GITHUB_ENV
+
+      - name: Create / Update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP }}
+          name: Breakers Companion ${{ github.ref_name }}
+          draft: false
+          prerelease: false
