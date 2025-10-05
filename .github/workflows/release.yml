@@ -4,10 +4,10 @@ name: Build & Attach Windows Release
 on:
   push:
     tags:
-      - 'v*'     # e.g. v2.0.22, v2.0.23, etc.
+      - 'v*'   # runs on tags like v2.0.23, v2.0.24, etc.
 
 permissions:
-  contents: write  # required to create/update a release and upload assets
+  contents: write
 
 jobs:
   build-windows:
@@ -17,19 +17,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Setup Python 3.13
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'  # stable for PyInstaller + PySide6
+          python-version: '3.13'
+          cache: 'pip'
 
-      - name: Install dependencies
+      - name: Install dependencies (into THIS Python)
         shell: pwsh
         run: |
-          python -m pip install --upgrade pip
+          python -V
+          python -m pip install --upgrade pip wheel setuptools
           if (Test-Path "requirements.txt") {
-            pip install -r "requirements.txt"
+            python -m pip install -r "requirements.txt"
           }
-          python -m pip install pyinstaller
+          # PyInstaller <7 keeps wide compatibility; bump later if you like
+          python -m pip install "pyinstaller<7"
+
+      - name: Verify PyInstaller present
+        shell: pwsh
+        run: |
+          python -c "import sys, site; print('Exe:', sys.executable); print('Site:', site.getsitepackages())"
+          python -c "import PyInstaller, sys; print('PyInstaller:', PyInstaller.__version__); print('Python:', sys.version)"
 
       - name: Build EXE (spec or app.py)
         shell: pwsh
@@ -56,13 +65,12 @@ jobs:
             throw "Build failed: could not find the EXE in dist."
           }
 
-          # Expose for later steps
           "EXE_PATH=$exePath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Package folder
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"      # e.g., v2.0.22
+          $tag = "${{ github.ref_name }}"      # e.g., v2.0.23
           if ($tag -match '^v(.+)$') { $ver = $Matches[1] } else { $ver = $tag }
           $pkg = "Breakers Companion-$ver"
 
@@ -75,7 +83,6 @@ jobs:
           if (Test-Path ".\Version") { Copy-Item ".\Version" "$pkg\Version" }
 
           Compress-Archive -Path "$pkg\*" -DestinationPath "$pkg.zip" -Force
-
           "PKG_ZIP=$pkg.zip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Create / Update GitHub Release
