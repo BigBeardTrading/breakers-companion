@@ -1,16 +1,16 @@
+# .github/workflows/release.yml
 name: Build & Attach Windows Release
 
 on:
   push:
     tags:
-      - 'v*'           # runs on tags like v2.0.4
-
-permissions:
-  contents: write      # needed to create/upload the release asset
+      - 'v*'   # run on tags like v2.0.21, v2.0.22, etc.
 
 jobs:
   build-windows:
     runs-on: windows-latest
+    permissions:
+      contents: write  # needed to create/upload a release asset
 
     steps:
       - name: Checkout
@@ -19,39 +19,44 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'   # fine for PyInstaller / PySide6
+          python-version: '3.12'  # stable for PyInstaller on GH runners
 
       - name: Install dependencies
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if (Test-Path "requirements.txt") {
+            pip install -r "requirements.txt"
+          }
           pip install pyinstaller
 
-      - name: Build EXE with PyInstaller
+      - name: Build EXE (spec or app.py)
         shell: pwsh
-        run: python -m PyInstaller ".\Breakers Companion.spec"
+        run: |
+          if (Test-Path ".\Breakers Companion.spec") {
+            py -m PyInstaller ".\Breakers Companion.spec"
+          }
+          else {
+            Write-Host "Spec not found. Building from app.py as onefile..."
+            py -m PyInstaller --noconfirm --onefile --name "Breakers Companion" ".\app.py"
+          }
+
+      - name: Verify build output
+        shell: pwsh
+        run: |
+          if (-not (Test-Path ".\dist\Breakers Companion.exe")) {
+            Write-Host "dist contents:"; Get-ChildItem ".\dist" -Recurse | Format-Table -AutoSize
+            throw "Build failed: '.\dist\Breakers Companion.exe' not found."
+          }
 
       - name: Package folder
         shell: pwsh
         run: |
-          $ver = "${{ github.ref_name }}"          # e.g. v2.0.4
+          $tag = "${{ github.ref_name }}"         # e.g., v2.0.21
+          if ($tag -match '^v(.+)$') { $ver = $Matches[1] } else { $ver = $tag }
           $pkg = "Breakers Companion-$ver"
+
           Remove-Item -Recurse -Force $pkg -ErrorAction SilentlyContinue
           New-Item -ItemType Directory $pkg | Out-Null
-          Copy-Item ".\dist\Breakers Companion.exe" "$pkg\Breakers Companion.exe"
-          Copy-Item -Recurse -Force ".\assets" "$pkg\assets"
-          if (Test-Path .\run.bat) { Copy-Item .\run.bat "$pkg\run.bat" }
-          Compress-Archive -Path "$pkg\*" -DestinationPath "$pkg.zip" -Force
 
-      - name: Upload artifact (optional)
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-zip
-          path: "Breakers Companion-${{ github.ref_name }}.zip"
-          if-no-files-found: error
-
-      - name: Attach to GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: "Breakers Companion-${{ github.ref_name }}.zip"
+          Copy-Item ".\dist\Breakers Companion.exe" "$pkg\Break
