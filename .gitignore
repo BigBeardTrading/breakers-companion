@@ -19,3 +19,7 @@ build/
 dist/
 logs/
 *.spec
+
+# Local release bundles
+*.zip
+Breakers Companion-v*/
