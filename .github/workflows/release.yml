@@ -1,15 +1,16 @@
-# .github/workflows/release.yml
 name: Build & Attach Windows Release
 
 on:
   push:
-    tags: ['v*']   # runs when you push tags like v2.0.3
+    tags:
+      - 'v*'           # runs on tags like v2.0.4
+
+permissions:
+  contents: write      # needed to create/upload the release asset
 
 jobs:
   build-windows:
     runs-on: windows-latest
-    permissions:
-      contents: write   # needed to create/upload the release asset
 
     steps:
       - name: Checkout
@@ -18,7 +19,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.13'   # if this image lacks 3.13, change to '3.12'
+          python-version: '3.12'   # fine for PyInstaller / PySide6
 
       - name: Install dependencies
         shell: pwsh
@@ -29,28 +30,28 @@ jobs:
 
       - name: Build EXE with PyInstaller
         shell: pwsh
-        run: py -m PyInstaller ".\Breakers Companion.spec"
+        run: python -m PyInstaller ".\Breakers Companion.spec"
 
-      - name: Package zip
+      - name: Package folder
         shell: pwsh
         run: |
-          $ver = "${{ github.ref_name }}"           # e.g. v2.0.3
+          $ver = "${{ github.ref_name }}"          # e.g. v2.0.4
           $pkg = "Breakers Companion-$ver"
+          Remove-Item -Recurse -Force $pkg -ErrorAction SilentlyContinue
           New-Item -ItemType Directory $pkg | Out-Null
           Copy-Item ".\dist\Breakers Companion.exe" "$pkg\Breakers Companion.exe"
-          Copy-Item -Recurse ".\assets" "$pkg\assets"
+          Copy-Item -Recurse -Force ".\assets" "$pkg\assets"
+          if (Test-Path .\run.bat) { Copy-Item .\run.bat "$pkg\run.bat" }
           Compress-Archive -Path "$pkg\*" -DestinationPath "$pkg.zip" -Force
-          "PKG_ZIP=$pkg.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Upload artifact (optional)
         uses: actions/upload-artifact@v4
         with:
-          name: release-zip
-          path: ${{ env.PKG_ZIP }}
+          name: windows-zip
+          path: "Breakers Companion-${{ github.ref_name }}.zip"
+          if-no-files-found: error
 
-      - name: Attach zip to GitHub Release
+      - name: Attach to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.PKG_ZIP }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          files: "Breakers Companion-${{ github.ref_name }}.zip"
