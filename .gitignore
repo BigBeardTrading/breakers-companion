@@ -1,29 +1,21 @@
-# Python
-__pycache__/
-*.pyc
+﻿# Runtime/user files
+saved_sets.json
+settings.json
 
-# Virtual env
+# Local launchers
+Run Companion (PowerShell).bat
+
+# Scratch/old assets (keep repo clean)
+assets/Backgroundold*.png
+assets/Background0ld1.png
+assets/Background_fixed_dark.png
+assets/Background_fixed_light.png
+assets/Home Button.png
+assets/BTT-icon on brick.png
+
+# Build/venv artifacts
 .venv/
-
-# Build artifacts
 build/
 dist/
-release/
-
-# PyInstaller stuff
-*.spec
-
-# Logs and local data
 logs/
-*.log
-
-# Certificates / private stuff
-certs/
-*.pfx
-*.cer
-
-# OS / editor
-.DS_Store
-Thumbs.db
-.vscode/
-.idea/
+*.spec

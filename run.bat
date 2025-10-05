@@ -3,7 +3,7 @@ setlocal ENABLEDELAYEDEXPANSION
 
 REM --- Always run from this .bat's folder ---
 set "BASEDIR=%~dp0"
-cd /d "%BASEDIR%"
+cd /d "%~dp0"
 
 REM --- Logs folder ---
 if not exist "logs" mkdir "logs"
